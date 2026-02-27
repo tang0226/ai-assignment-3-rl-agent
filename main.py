@@ -1,6 +1,6 @@
 import torch
 import gymnasium as gym
-import pygame as pg
+import pygame
 import numpy as np
 
 class SlipperyEnv(gym.Env):
@@ -11,12 +11,18 @@ class SlipperyEnv(gym.Env):
       friction: float = 0.95,
       accel_coeff = 0.0001,
       min_target_dist_coeff: float = 0.4,
+      max_steps: int = 1000,
+      render_mode = 'human',
   ):
+    self.metadata = {'render_modes': ['human', 'rgb_array'], 'render_fps': 60}
+
     self.size = size                                    # Size of space in pixels
     self.agent_size = agent_size                        # Size of agent's circular collision shape
     self.friction = friction                            # Coefficient of friction
     self.accel_coeff = accel_coeff                      # Strength of movement actions, relative to the size of the space
     self.min_target_dist_coeff = min_target_dist_coeff  # Relates environment size to the min distance for agent to travel
+    self.max_steps = max_steps                          # max number of steps before an episode is truncated; passed to the TimeLimit wrapper
+
     if (self.min_target_dist_coeff >= 0.5):
       raise ValueError('min_target_dist_coeff must be less than 0.5')
 
@@ -37,12 +43,25 @@ class SlipperyEnv(gym.Env):
 
     self.accel = self.size * self.accel_coeff
     self._action_to_dv = {
-      0: np.array([0, 0]),
-      1: np.array([0, self.accel]),
+      0: np.array([0, self.accel]),
+      1: np.array([self.accel, self.accel]),
       2: np.array([self.accel, 0]),
-      3: np.array([0, -self.accel]),
-      4: np.array([-self.accel, 0]),
+      3: np.array([self.accel, -self.accel]),
+      4: np.array([0, -self.accel]),
+      5: np.array([-self.accel, -self.accel]),
+      6: np.array([-self.accel, 0]),
+      7: np.array([-self.accel, self.accel]),
     }
+
+    # ensure a valid render_mode value is being passed
+    assert render_mode is None or render_mode in self.metadata['render_modes']
+    self.render_mode = render_mode
+
+    # used with human render mode
+    self.window = None
+    self.clock = None
+
+    self.window_size = self.size
 
 
   def _get_obs(self):
@@ -113,6 +132,7 @@ class SlipperyEnv(gym.Env):
 
     return observation, info
 
+
   def step(self, action):
     """Execute an action within the environment.
     Args:
@@ -129,12 +149,10 @@ class SlipperyEnv(gym.Env):
     self._agent_position += self._agent_v
 
     # reward
-    reached = False
     reward = 0
-    if self._get_dist_to_target() < self.agent_size:
-      reached = True
+    if self._get_dist_to_target() < self.agent_size / 2:
       reward += 1
-      self._reset_target_position
+      self._reset_target_position()
     else:
       reward += -0.01
     
@@ -151,15 +169,71 @@ class SlipperyEnv(gym.Env):
       self._respawn_agent()
     
     observation = self._get_obs()
-    terminated = False
-    truncated = False
     info = self._get_info()
-    return observation, reward, terminated, truncated, info
-
-
-
+    return observation, reward, False, None, info
+  
+  
+  def _render_canvas(self):
+    if self.window is None and self.render_mode == 'human':
+      pygame.init()
+      pygame.display.init()
+      self.window = pygame.display.set_mode(
+        (self.window_size, self.window_size)
+      )
+    if self.clock is None and self.render_mode == 'human':
+      self.clock = pygame.time.Clock()
     
+    canvas = pygame.Surface((self.window_size, self.window_size))
+    canvas.fill((255, 255, 255))
+  
+    # ice
+    pygame.draw.rect(
+      canvas,
+      (175, 221, 240),
+      pygame.Rect(0, 0, self.size, self.size)
+    )
 
-env = SlipperyEnv()
+    # target
+    pygame.draw.circle(
+      canvas,
+      (0, 170, 0),
+      self._target_position,
+      10
+    )
+    # agent
+    pygame.draw.circle(
+      canvas,
+      (0, 0, 0),
+      self._agent_position,
+      self.agent_size / 2
+    )
 
-print(env.reset())
+    if self.render_mode == 'human':
+      self.window.blit(canvas, canvas.get_rect())
+      pygame.event.pump()
+      pygame.display.update()
+
+      self.clock.tick(self.metadata['render_fps'])
+    else:
+      # swap the width and height axes with transpose
+      # pixels3d returns shape (width, height, 3)
+      return np.transpose(np.array(pygame.surfarray.pixels3d(canvas)), axes=(1, 0, 2))
+  
+  def render(self):
+    self._render_canvas()
+
+env = SlipperyEnv(
+  agent_size=50,
+  min_target_dist_coeff=0.2,
+)
+
+env = gym.wrappers.TimeLimit(env, env.max_steps)
+
+env.reset()
+
+for i in range(3):
+  while True:
+    observation, reward, terminated, truncated, info = env.step(np.random.randint(0, 8))
+    env.render()
+    if terminated or truncated:
+      break
