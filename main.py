@@ -1,8 +1,12 @@
 import torch
 from torch import nn
+from torch.optim import AdamW
 import gymnasium as gym
 import pygame
 import numpy as np
+
+def cosine_similarity(vec1, vec2):
+  return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
 
 device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else 'cpu'
 print(f'Using {device} device')
@@ -20,21 +24,23 @@ class SlipperyEnv(gym.Env):
       min_target_dist_coeff: float = 0.4,
       goal_reward: float = 20,
       time_penalty: float = -1/60, # lose 1 reward for every second
+      direction_reward_scale: float = 0.5, # halve the time penalty if agent is moving directly towards the target
       edge_penalty: float = -20,
       max_steps: int = 1800,
       render_mode = 'human',
   ):
     self.metadata = {'render_modes': ['human', 'rgb_array'], 'render_fps': 60}
 
-    self.size = size                                    # Size of space in pixels
-    self.agent_size = agent_size                        # Size of agent's circular collision shape
-    self.friction = friction                            # Coefficient of friction
-    self.accel = accel                                  # Acceleration of movement, measured in px/frame^2
-    self.min_target_dist_coeff = min_target_dist_coeff  # Relates environment size to the min distance for agent to travel
-    self.goal_reward = goal_reward                      # Reward for reaching goal
-    self.time_penalty = time_penalty                    # Reward lost with each frame
-    self.edge_penalty = edge_penalty                    # Reward lost for hitting edge
-    self.max_steps = max_steps                          # max number of steps before an episode is truncated; passed to the TimeLimit wrapper
+    self.size = size                                     # Size of space in pixels
+    self.agent_size = agent_size                         # Size of agent's circular collision shape
+    self.friction = friction                             # Coefficient of friction
+    self.accel = accel                                   # Acceleration of movement, measured in px/frame^2
+    self.min_target_dist_coeff = min_target_dist_coeff   # Relates environment size to the min distance for agent to travel
+    self.goal_reward = goal_reward                       # Reward for reaching goal
+    self.time_penalty = time_penalty                     # Reward lost with each frame
+    self.direction_reward_scale = direction_reward_scale # Scale of the reward depending on what direction the agent is moving
+    self.edge_penalty = edge_penalty                     # Reward lost for hitting edge
+    self.max_steps = max_steps                           # max number of steps before an episode is truncated; passed to the TimeLimit wrapper
 
     assert self.friction < 1 and self.friction > 0
 
@@ -190,7 +196,14 @@ class SlipperyEnv(gym.Env):
       reward += self.goal_reward
       self._reset_target_position()
     else:
-      reward += self.time_penalty
+      # use cosine similarity to scale down the time penalty if the agent is moving towards the target
+      # conversely, the penalty will be increased if the agent is moving in the opposite direction
+      penalty = self.time_penalty
+      penalty *= self.direction_reward_scale ** -cosine_similarity(
+        self._target_position - self._agent_position,
+        self._agent_v
+      )
+      reward += penalty
     
     pos = self._agent_position
     if (
@@ -209,7 +222,7 @@ class SlipperyEnv(gym.Env):
     return observation, reward, False, None, info
   
   
-  def _render_canvas(self):
+  def setup_pygame(self):
     if self.window is None and self.render_mode == 'human':
       pygame.init()
       pygame.display.init()
@@ -218,7 +231,21 @@ class SlipperyEnv(gym.Env):
       )
     if self.clock is None and self.render_mode == 'human':
       self.clock = pygame.time.Clock()
-    
+
+  def cleanup_pygame(self):
+    if (self.window is not None):
+      pygame.display.quit()
+      self.window = None
+    if (self.clock is not None):
+      self.clock = None
+
+
+  def _render_canvas(self, render_to_window = True):
+    if render_to_window:
+      self.setup_pygame()
+    else:
+      self.cleanup_pygame()
+
     canvas = pygame.Surface((self.window_size, self.window_size))
     canvas.fill((255, 255, 255))
   
@@ -244,7 +271,7 @@ class SlipperyEnv(gym.Env):
       self.agent_size / 2
     )
 
-    if self.render_mode == 'human':
+    if self.render_mode == 'human' and self.window is not None:
       self.window.blit(canvas, canvas.get_rect())
       pygame.event.pump()
       pygame.display.update()
@@ -255,8 +282,8 @@ class SlipperyEnv(gym.Env):
       # pixels3d returns shape (width, height, 3)
       return np.transpose(np.array(pygame.surfarray.pixels3d(canvas)), axes=(1, 0, 2))
   
-  def render(self):
-    self._render_canvas()
+  def render(self, render_to_window = True):
+    self._render_canvas(render_to_window)
 
 #####################
 ### AGENT NETWORK ###
@@ -294,38 +321,128 @@ class SlipperyRewardEstNN(nn.Module):
     logits = self.linear_relu_stack(x)
     return logits
 
+softmax = nn.Softmax(dim=1)
 
 
 env = SlipperyEnv(
   size=500,
   agent_size=30,
-  friction=0.995,
   min_target_dist_coeff=0.2,
+
+  friction=0.95,
+  accel=0.05,
+
+  goal_reward=20,
+  time_penalty=-1/60,
+  direction_reward_scale=0.3,
+  edge_penalty=-20,
+
+  max_steps=3600,
 )
 
 env = gym.wrappers.TimeLimit(env, env.max_steps)
 unwrapped = env.unwrapped
 
-agent_network = SlipperyAgentNN()
-agent_network.to(device)
+policy = SlipperyAgentNN()
+policy.to(device)
+# learning rate for policy network
+a_theta = 0.01
+policy_optim = AdamW(policy.parameters(), lr=a_theta)
 
-est_network = SlipperyRewardEstNN()
-est_network.to(device)
+baseline = SlipperyRewardEstNN()
+baseline.to(device)
+# learning rate for baseline network
+a_b = 0.01
+baseline_optim = AdamW(baseline.parameters(), lr=a_b)
+
+gamma = 0.95
+return_scale = 1
+
+epsilon = 0.2
+epsilon_decay = 0.9
+min_epsilon = 0.01
 
 observation, info = env.reset()
+norm_obs = torch.Tensor(unwrapped.normalize_obs(observation))
+norm_obs = norm_obs.to(device) # move to gpu
+episode = 0
 
-for episode in range(5):
+while True:
   total_reward = 0
   observation, info = env.reset()
-  while True:
-    normalized = torch.Tensor(unwrapped.normalize_obs(observation))
-    normalized = normalized.to(device) # move to gpu
 
-    # get action from agent network
-    action = torch.argmax(agent_network.forward(normalized)).item()
+  # history for states, actions, rewards, discounted rewards, and the probability of the chosen action
+  s = []
+  a = []
+  r = []
+  dr = []
+  pi = []
+
+  episode_length = 0
+  #should_render = episode % 100 == 99
+  should_render = False
+  
+  # run the episode
+  while True:
+    norm_obs = torch.tensor(unwrapped.normalize_obs(observation), dtype=torch.float32, device=device)
+    # get action
+    action = None
+    
+    policy_logits = policy.forward(norm_obs)
+    action_probabilities = torch.softmax(policy_logits, dim=-1)
+    # pick a random action with probability `epsilon`
+    if (env.np_random.random() < epsilon):
+      action = env.np_random.integers(0, 8)
+    else:
+      # greedy
+      action = torch.argmax(action_probabilities).item()
+
+    s.append(norm_obs)
+    a.append(action)
+    pi.append(action_probabilities[action])
     observation, reward, terminated, truncated, info = env.step(action)
+    r.append(reward)
     total_reward += reward
-    env.render()
+
+    episode_length += 1
+
+    if (should_render):
+      unwrapped.render()
+
+    # check if the episode is over
     if terminated or truncated:
+      # clean up pygame if this episode was rendered
+      if (should_render):
+        unwrapped.cleanup_pygame()
       break
-  print(episode, total_reward)
+  
+  #----------------------
+  # agent network updates
+  #----------------------
+
+  # calculate discounted rewards and train baseline network
+  dr = [0] * episode_length
+  dr[episode_length - 1] = r[-1]
+  baseline_loss = 0
+  for i in range(episode_length - 2, -1, -1):
+    dr[i] = r[i] + gamma * dr[i + 1] * return_scale
+
+    # use squared error
+    baseline_loss += (baseline.forward(s[i])[0] - dr[i]) ** 2
+
+  baseline.zero_grad()
+  baseline_loss.backward()
+  baseline_optim.step()
+  
+  # train policy
+  policy_loss = 0
+  for i in range(episode_length):
+    # get separate baseline r value, detached from baseline's computation graph
+    b_value = baseline.forward(s[i])[0].detach()
+    policy_loss += -torch.log(pi[i]) * (dr[i] - b_value)
+  policy.zero_grad()
+  policy_loss.backward()
+  policy_optim.step()
+
+  print(episode, np.mean(r), baseline_loss.item(), policy_loss.item())
+  episode += 1
