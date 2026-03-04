@@ -292,11 +292,11 @@ class SlipperyAgentNN(nn.Module):
   def __init__(self):
     super().__init__()
     self.linear_relu_stack = nn.Sequential(
-      nn.Linear(6, 64),
+      nn.Linear(6, 32),
       nn.ReLU(),
-      nn.Linear(64, 64),
+      nn.Linear(32, 32),
       nn.ReLU(),
-      nn.Linear(64, 8),
+      nn.Linear(32, 8),
     )
 
   def forward(self, x):
@@ -310,11 +310,11 @@ class SlipperyRewardEstNN(nn.Module):
   def __init__(self):
     super().__init__()
     self.linear_relu_stack = nn.Sequential(
-      nn.Linear(6, 64),
+      nn.Linear(6, 32),
       nn.ReLU(),
-      nn.Linear(64, 64),
+      nn.Linear(32, 32),
       nn.ReLU(),
-      nn.Linear(64, 1),
+      nn.Linear(32, 1),
     )
 
   def forward(self, x):
@@ -333,7 +333,7 @@ env = SlipperyEnv(
   accel=0.05,
 
   goal_reward=20,
-  time_penalty=-1/60,
+  time_penalty=-1/180,
   direction_reward_scale=0.3,
   edge_penalty=-20,
 
@@ -355,10 +355,10 @@ baseline.to(device)
 a_b = 0.01
 baseline_optim = AdamW(baseline.parameters(), lr=a_b)
 
-gamma = 0.95
+gamma = 0.99
 return_scale = 1
 
-epsilon = 0.2
+epsilon = 0.1
 epsilon_decay = 0.9
 min_epsilon = 0.01
 
@@ -376,7 +376,7 @@ while True:
   a = []
   r = []
   dr = []
-  pi = []
+  log_probs = []
 
   episode_length = 0
   #should_render = episode % 100 == 99
@@ -399,7 +399,7 @@ while True:
 
     s.append(norm_obs)
     a.append(action)
-    pi.append(action_probabilities[action])
+    log_probs.append(torch.log(action_probabilities[action]))
     observation, reward, terminated, truncated, info = env.step(action)
     r.append(reward)
     total_reward += reward
@@ -416,31 +416,32 @@ while True:
         unwrapped.cleanup_pygame()
       break
   
+  # convert lists to tensors
+  s = torch.stack(s, dim=0)
+  log_probs = torch.stack(log_probs, dim=0)
+
   #----------------------
   # agent network updates
   #----------------------
 
   # calculate discounted rewards and train baseline network
-  dr = [0] * episode_length
+  dr = torch.zeros(episode_length, dtype=torch.float32, device=device)
   dr[episode_length - 1] = r[-1]
-  baseline_loss = 0
   for i in range(episode_length - 2, -1, -1):
     dr[i] = r[i] + gamma * dr[i + 1] * return_scale
 
-    # use squared error
-    baseline_loss += (baseline.forward(s[i])[0] - dr[i]) ** 2
 
-  baseline.zero_grad()
+  baseline_loss = torch.sum((baseline.forward(s) - dr) ** 2) / episode_length
+  
+  baseline_optim.zero_grad()
   baseline_loss.backward()
   baseline_optim.step()
   
   # train policy
-  policy_loss = 0
-  for i in range(episode_length):
-    # get separate baseline r value, detached from baseline's computation graph
-    b_value = baseline.forward(s[i])[0].detach()
-    policy_loss += -torch.log(pi[i]) * (dr[i] - b_value)
-  policy.zero_grad()
+  b_values = baseline.forward(s).detach()
+  policy_loss = torch.sum(-log_probs * (dr - b_values)) / episode_length
+
+  policy_optim.zero_grad()
   policy_loss.backward()
   policy_optim.step()
 
