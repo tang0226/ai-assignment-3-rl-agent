@@ -49,6 +49,7 @@ class SlipperyEnv(gym.Env):
 
     self.min_target_dist = self.size * self.min_target_dist_coeff
     self.max_lateral_speed = self.accel / (1 - self.friction)
+    self.max_v_magnitude = self.max_lateral_speed * 2 ** 0.5
 
     self._agent_position = np.array([0, 0], dtype=float)
     self._target_position = np.array([0, 0], dtype=float)
@@ -196,14 +197,12 @@ class SlipperyEnv(gym.Env):
       reward += self.goal_reward
       self._reset_target_position()
     else:
-      # use cosine similarity to scale down the time penalty if the agent is moving towards the target
-      # conversely, the penalty will be increased if the agent is moving in the opposite direction
-      penalty = self.time_penalty
-      penalty *= self.direction_reward_scale ** -cosine_similarity(
+      c_sim = cosine_similarity(
         self._target_position - self._agent_position,
         self._agent_v
       )
-      reward += penalty
+
+      reward += c_sim * self.direction_reward_scale * (np.linalg.norm(self._agent_v) / self.max_v_magnitude)
     
     pos = self._agent_position
     if (
@@ -212,7 +211,7 @@ class SlipperyEnv(gym.Env):
       pos[1] < 0 or
       pos[1] > self.size
     ):
-      # heavy penalty for "falling off the edge"
+      # penalty for "falling off the edge"
       reward += self.edge_penalty
       # respawn agent
       self._respawn_agent()
@@ -321,23 +320,21 @@ class SlipperyRewardEstNN(nn.Module):
     logits = self.linear_relu_stack(x)
     return logits
 
-softmax = nn.Softmax(dim=1)
 
 
 env = SlipperyEnv(
   size=500,
-  agent_size=30,
-  min_target_dist_coeff=0.2,
+  agent_size=40,
+  min_target_dist_coeff=0.1,
 
   friction=0.95,
-  accel=0.05,
+  accel=0.07,
 
-  goal_reward=20,
-  time_penalty=-1/180,
-  direction_reward_scale=0.3,
-  edge_penalty=-20,
+  goal_reward=10,
+  direction_reward_scale=0.2,
+  edge_penalty=-5,
 
-  max_steps=3600,
+  max_steps=600,
 )
 
 env = gym.wrappers.TimeLimit(env, env.max_steps)
@@ -358,13 +355,8 @@ baseline_optim = AdamW(baseline.parameters(), lr=a_b)
 gamma = 0.99
 return_scale = 1
 
-epsilon = 0.1
-epsilon_decay = 0.9
-min_epsilon = 0.01
-
 observation, info = env.reset()
-norm_obs = torch.Tensor(unwrapped.normalize_obs(observation))
-norm_obs = norm_obs.to(device) # move to gpu
+norm_obs = torch.tensor(unwrapped.normalize_obs(observation), device=device)
 episode = 0
 
 while True:
@@ -379,8 +371,8 @@ while True:
   log_probs = []
 
   episode_length = 0
-  #should_render = episode % 100 == 99
-  should_render = False
+  should_render = episode % 50 == 0
+  #should_render = False
   
   # run the episode
   while True:
@@ -389,17 +381,13 @@ while True:
     action = None
     
     policy_logits = policy.forward(norm_obs)
-    action_probabilities = torch.softmax(policy_logits, dim=-1)
-    # pick a random action with probability `epsilon`
-    if (env.np_random.random() < epsilon):
-      action = env.np_random.integers(0, 8)
-    else:
-      # greedy
-      action = torch.argmax(action_probabilities).item()
-
+    action_probs = torch.softmax(policy_logits, dim=-1)
+    dist = torch.distributions.Categorical(action_probs)
+    # sample an action from the action probability distribution
+    action = dist.sample().item()
     s.append(norm_obs)
     a.append(action)
-    log_probs.append(torch.log(action_probabilities[action]))
+    log_probs.append(torch.log(action_probs[action]))
     observation, reward, terminated, truncated, info = env.step(action)
     r.append(reward)
     total_reward += reward
@@ -431,19 +419,21 @@ while True:
     dr[i] = r[i] + gamma * dr[i + 1] * return_scale
 
 
-  baseline_loss = torch.sum((baseline.forward(s) - dr) ** 2) / episode_length
-  
+  b_values = baseline.forward(s)
+
+  baseline_loss = torch.sum((b_values - dr) ** 2) / episode_length
+
   baseline_optim.zero_grad()
   baseline_loss.backward()
   baseline_optim.step()
   
   # train policy
-  b_values = baseline.forward(s).detach()
+  b_values = b_values.detach() # detach b_values from autograd graph
   policy_loss = torch.sum(-log_probs * (dr - b_values)) / episode_length
 
   policy_optim.zero_grad()
   policy_loss.backward()
   policy_optim.step()
 
-  print(episode, np.mean(r), baseline_loss.item(), policy_loss.item())
+  print(episode, np.mean(r), baseline_loss.item())
   episode += 1
