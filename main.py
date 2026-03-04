@@ -8,7 +8,8 @@ import numpy as np
 def cosine_similarity(vec1, vec2):
   return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
 
-device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else 'cpu'
+#device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else 'cpu'
+device = 'cpu'
 print(f'Using {device} device')
 
 ###################
@@ -27,6 +28,7 @@ class SlipperyEnv(gym.Env):
       direction_reward_scale: float = 0.5, # halve the time penalty if agent is moving directly towards the target
       edge_penalty: float = -20,
       max_steps: int = 1800,
+      target_reset_interval: int = 600,
       render_mode = 'human',
   ):
     self.metadata = {'render_modes': ['human', 'rgb_array'], 'render_fps': 60}
@@ -41,6 +43,7 @@ class SlipperyEnv(gym.Env):
     self.direction_reward_scale = direction_reward_scale # Scale of the reward depending on what direction the agent is moving
     self.edge_penalty = edge_penalty                     # Reward lost for hitting edge
     self.max_steps = max_steps                           # max number of steps before an episode is truncated; passed to the TimeLimit wrapper
+    self.target_reset_interval = target_reset_interval   # steps interval after which target automatically resets to a random position
 
     assert self.friction < 1 and self.friction > 0
 
@@ -76,6 +79,8 @@ class SlipperyEnv(gym.Env):
     }
 
     self._latest_action = None
+
+    self.curr_step = 0
 
     # ensure a valid render_mode value is being passed
     assert render_mode is None or render_mode in self.metadata['render_modes']
@@ -170,6 +175,8 @@ class SlipperyEnv(gym.Env):
     observation = self._get_obs()
     info = self._get_info()
 
+    self.curr_step = 0
+
     return observation, info
 
 
@@ -202,7 +209,7 @@ class SlipperyEnv(gym.Env):
         self._agent_v
       )
 
-      reward += c_sim * self.direction_reward_scale * (np.linalg.norm(self._agent_v) / self.max_v_magnitude)
+      reward += c_sim * self.direction_reward_scale * (np.linalg.norm(self._agent_v) / self.max_v_magnitude) ** 2
     
     pos = self._agent_position
     if (
@@ -216,6 +223,13 @@ class SlipperyEnv(gym.Env):
       # respawn agent
       self._respawn_agent()
     
+
+    self.curr_step += 1
+
+    # target reset interval
+    if (self.curr_step % self.target_reset_interval == 0):
+      self._reset_target_position()
+
     observation = self._get_obs()
     info = self._get_info()
     return observation, reward, False, None, info
@@ -331,32 +345,35 @@ env = SlipperyEnv(
   accel=0.07,
 
   goal_reward=10,
-  direction_reward_scale=0.2,
-  edge_penalty=-5,
+  direction_reward_scale=1,
+  edge_penalty=-10,
 
-  max_steps=600,
+  max_steps=3000,
+  target_reset_interval=600,
 )
 
 env = gym.wrappers.TimeLimit(env, env.max_steps)
 unwrapped = env.unwrapped
 
 policy = SlipperyAgentNN()
-policy.to(device)
+policy_device = 'cpu'
+policy.to(policy_device)
 # learning rate for policy network
-a_theta = 0.01
+a_theta = 0.001
 policy_optim = AdamW(policy.parameters(), lr=a_theta)
 
 baseline = SlipperyRewardEstNN()
-baseline.to(device)
+baseline_device = 'cpu'
+baseline.to(baseline_device)
 # learning rate for baseline network
-a_b = 0.01
+a_b = 0.001
 baseline_optim = AdamW(baseline.parameters(), lr=a_b)
 
-gamma = 0.99
-return_scale = 1
+gamma = 0.995
+return_scale = 0.1
 
 observation, info = env.reset()
-norm_obs = torch.tensor(unwrapped.normalize_obs(observation), device=device)
+norm_obs = torch.tensor(unwrapped.normalize_obs(observation), device=policy_device)
 episode = 0
 
 while True:
@@ -371,12 +388,12 @@ while True:
   log_probs = []
 
   episode_length = 0
-  should_render = episode % 50 == 0
-  #should_render = False
+  #should_render = episode % 50 == 0
+  should_render = False
   
   # run the episode
   while True:
-    norm_obs = torch.tensor(unwrapped.normalize_obs(observation), dtype=torch.float32, device=device)
+    norm_obs = torch.tensor(unwrapped.normalize_obs(observation), dtype=torch.float32, device=policy_device)
     # get action
     action = None
     
@@ -404,24 +421,25 @@ while True:
         unwrapped.cleanup_pygame()
       break
   
-  # convert lists to tensors
-  s = torch.stack(s, dim=0)
-  log_probs = torch.stack(log_probs, dim=0)
+  # convert lists to tensors and move to GPU for baseline network training
+  s = torch.stack(s, dim=0).to(device=baseline_device)
+  log_probs = torch.stack(log_probs, dim=0).to(device=baseline_device)
 
   #----------------------
   # agent network updates
   #----------------------
 
   # calculate discounted rewards and train baseline network
-  dr = torch.zeros(episode_length, dtype=torch.float32, device=device)
+  dr = torch.zeros(episode_length, dtype=torch.float32, device=baseline_device)
   dr[episode_length - 1] = r[-1]
   for i in range(episode_length - 2, -1, -1):
-    dr[i] = r[i] + gamma * dr[i + 1] * return_scale
-
+    dr[i] = r[i] + gamma * dr[i + 1]
+  # scale all returns
+  dr *= return_scale
 
   b_values = baseline.forward(s)
 
-  baseline_loss = torch.sum((b_values - dr) ** 2) / episode_length
+  baseline_loss = torch.mean((b_values - dr) ** 2)
 
   baseline_optim.zero_grad()
   baseline_loss.backward()
