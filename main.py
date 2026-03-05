@@ -5,6 +5,8 @@ import gymnasium as gym
 import pygame
 import numpy as np
 
+sqrt2 = 2 ** 0.5
+
 def cosine_similarity(vec1, vec2):
   return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
 
@@ -51,8 +53,7 @@ class SlipperyEnv(gym.Env):
       raise ValueError('min_target_dist_coeff must be less than 0.5')
 
     self.min_target_dist = self.size * self.min_target_dist_coeff
-    self.max_lateral_speed = self.accel / (1 - self.friction)
-    self.max_v_magnitude = self.max_lateral_speed * 2 ** 0.5
+    self.max_v = self.accel / (1 - self.friction)
 
     self._agent_position = np.array([0, 0], dtype=float)
     self._target_position = np.array([0, 0], dtype=float)
@@ -69,13 +70,13 @@ class SlipperyEnv(gym.Env):
 
     self._action_to_dv = {
       0: np.array([0, self.accel]),
-      1: np.array([self.accel, self.accel]),
+      1: np.array([self.accel / sqrt2, self.accel / sqrt2]),
       2: np.array([self.accel, 0]),
-      3: np.array([self.accel, -self.accel]),
+      3: np.array([self.accel / sqrt2, -self.accel / sqrt2]),
       4: np.array([0, -self.accel]),
-      5: np.array([-self.accel, -self.accel]),
+      5: np.array([-self.accel / sqrt2, -self.accel / sqrt2]),
       6: np.array([-self.accel, 0]),
-      7: np.array([-self.accel, self.accel]),
+      7: np.array([-self.accel / sqrt2, self.accel / sqrt2]),
     }
 
     self._latest_action = None
@@ -112,8 +113,8 @@ class SlipperyEnv(gym.Env):
       obs['agent'][1] / self.size,
       obs['target'][0] / self.size,
       obs['target'][1] / self.size,
-      obs['v'][0] / self.max_lateral_speed,
-      obs['v'][1] / self.max_lateral_speed,
+      obs['v'][0] / self.max_v,
+      obs['v'][1] / self.max_v,
     ]
 
   def _get_info(self):
@@ -176,6 +177,7 @@ class SlipperyEnv(gym.Env):
     info = self._get_info()
 
     self.curr_step = 0
+    self.target_reset_timer = self.target_reset_interval
 
     return observation, info
 
@@ -202,6 +204,8 @@ class SlipperyEnv(gym.Env):
     reward = 0
     if self._get_dist_to_target() < self.agent_size / 2:
       reward += self.goal_reward
+      # reset the target position and timer
+      self.target_reset_timer = self.target_reset_interval
       self._reset_target_position()
     else:
       c_sim = cosine_similarity(
@@ -209,7 +213,7 @@ class SlipperyEnv(gym.Env):
         self._agent_v
       )
 
-      reward += c_sim * self.direction_reward_scale * (np.linalg.norm(self._agent_v) / self.max_v_magnitude) ** 2
+      reward += c_sim * self.direction_reward_scale * (np.linalg.norm(self._agent_v) / self.max_v) ** 2
     
     pos = self._agent_position
     if (
@@ -226,8 +230,10 @@ class SlipperyEnv(gym.Env):
 
     self.curr_step += 1
 
-    # target reset interval
-    if (self.curr_step % self.target_reset_interval == 0):
+    # target reset timer
+    self.target_reset_timer -= 1
+    if self.target_reset_timer == 0:
+      self.target_reset_timer = self.target_reset_interval
       self._reset_target_position()
 
     observation = self._get_obs()
@@ -341,14 +347,14 @@ env = SlipperyEnv(
   agent_size=40,
   min_target_dist_coeff=0.1,
 
-  friction=0.95,
-  accel=0.07,
+  friction=0.98,
+  accel=0.08,
 
-  goal_reward=10,
+  goal_reward=30,
   direction_reward_scale=1,
-  edge_penalty=-10,
+  edge_penalty=-30,
 
-  max_steps=3000,
+  max_steps=2400,
   target_reset_interval=600,
 )
 
@@ -388,8 +394,8 @@ while True:
   log_probs = []
 
   episode_length = 0
-  #should_render = episode % 50 == 0
-  should_render = False
+  should_render = episode % 500 == 0
+  #should_render = False
   
   # run the episode
   while True:
@@ -447,7 +453,7 @@ while True:
   
   # train policy
   b_values = b_values.detach() # detach b_values from autograd graph
-  policy_loss = torch.sum(-log_probs * (dr - b_values)) / episode_length
+  policy_loss = torch.mean(-log_probs * (dr - b_values))
 
   policy_optim.zero_grad()
   policy_loss.backward()
