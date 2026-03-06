@@ -1,6 +1,5 @@
 import torch
 from torch import nn
-from torch.optim import AdamW
 import gymnasium as gym
 import pygame
 import numpy as np
@@ -13,9 +12,6 @@ sqrt2 = 2 ** 0.5
 def cosine_similarity(vec1, vec2):
   return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
 
-#device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else 'cpu'
-device = 'cpu'
-print(f'Using {device} device')
 
 ###################
 ### ENVIRONMENT ###
@@ -29,8 +25,8 @@ class SlipperyEnv(gym.Env):
       accel = 0.05,
       min_target_dist_coeff: float = 0.4,
       goal_reward: float = 20,
-      time_penalty: float = -1/60, # lose 1 reward for every second
-      direction_reward_scale: float = 0.5, # halve the time penalty if agent is moving directly towards the target
+      time_penalty: float = -1/60,
+      direction_reward_scale: float = 0.5,
       edge_penalty: float = -20,
       max_steps: int = 1800,
       target_reset_interval: int = 600,
@@ -69,7 +65,7 @@ class SlipperyEnv(gym.Env):
       'target': gym.spaces.Box(0, size - 1, shape=(2,), dtype=float)
     })
 
-    self.action_space = gym.spaces.Discrete(4)
+    self.action_space = gym.spaces.Discrete(8)
 
     self._action_to_dv = {
       0: np.array([0, self.accel]),
@@ -81,8 +77,6 @@ class SlipperyEnv(gym.Env):
       6: np.array([-self.accel, 0]),
       7: np.array([-self.accel / sqrt2, self.accel / sqrt2]),
     }
-
-    self._latest_action = None
 
     self.curr_step = 0
 
@@ -193,7 +187,6 @@ class SlipperyEnv(gym.Env):
     Returns:
       tuple: (observation, reward, terminated, truncated, info)
     """
-    self._latest_action = action
 
     # accelerate the agent according to the action
     dv = self._action_to_dv[action]
@@ -310,6 +303,7 @@ class SlipperyEnv(gym.Env):
   def render(self, render_to_window = True):
     self._render_canvas(render_to_window)
 
+
 #####################
 ### AGENT NETWORK ###
 #####################
@@ -327,6 +321,7 @@ class SlipperyAgentNN(nn.Module):
   def forward(self, x):
     logits = self.linear_relu_stack(x)
     return logits
+
 
 #################################
 ### REWARD ESTIMATION NETWORK ###
@@ -347,7 +342,13 @@ class SlipperyRewardEstNN(nn.Module):
     return logits
 
 
-# Environment and training settings
+#########################################
+### ENVIRONMENT AND TRAINING SETTINGS ###
+#########################################
+
+# Always use CPU (small network means the CPU-GPU overhead is not worth it)
+device = 'cpu'
+
 env = SlipperyEnv(
   size=500,
   agent_size=40,
@@ -377,25 +378,35 @@ episode_count = 10000
 # rendering and graphing settings
 render_during_training = False
 episode_render_interval = 500
+
+# how often to print episode information
 episode_print_interval = 10
 
+# moving average sizes for graphing
 avg_window_1 = 20
 avg_window_2 = 100
 
 
+#########################
+# NETWORK INITALIZATION #
+#########################
+
 policy = SlipperyAgentNN()
 policy_device = 'cpu'
 policy.to(policy_device)
-policy_optim = AdamW(policy.parameters(), lr=a_theta)
+policy_optim = torch.optim.AdamW(policy.parameters(), lr=a_theta)
 
 baseline = SlipperyRewardEstNN()
 baseline_device = 'cpu'
 baseline.to(baseline_device)
-baseline_optim = AdamW(baseline.parameters(), lr=a_b)
+baseline_optim = torch.optim.AdamW(baseline.parameters(), lr=a_b)
 
-# matplotlib
+
+########################################
+# MATPLOTLIB / GRAPHING INITIALIZATION #
+########################################
+
 plt.ion()
-
 fig, ax = plt.subplots()
 
 reward_graph, = ax.plot([], [], 'c-', label='reward/step')
@@ -412,11 +423,14 @@ reward_history = np.array([])
 reward_avg_1 = []
 reward_avg_2 = []
 
-observation, info = env.reset()
-norm_obs = torch.tensor(env.normalize_obs(observation), device=policy_device)
 episode = 0
-
 start_time = time.perf_counter()
+
+
+#####################
+# MAIN EPISODE LOOP #
+#####################
+
 while episode <= episode_count:
   total_reward = 0
   observation, info = env.reset()
@@ -431,21 +445,26 @@ while episode <= episode_count:
   episode_length = 0
   should_render = render_during_training and episode % episode_render_interval == 0
   
-  # run the episode
+  ###################
+  # RUN THE EPISODE #
+  ###################
   while True:
     norm_obs = torch.tensor(env.normalize_obs(observation), dtype=torch.float32, device=policy_device)
     # get action
     action = None
     
+    # sample an action from the agent network
     policy_logits = policy.forward(norm_obs)
     action_probs = torch.softmax(policy_logits, dim=-1)
     dist = torch.distributions.Categorical(action_probs)
-    # sample an action from the action probability distribution
     action = dist.sample().item()
+
     s.append(norm_obs)
     a.append(action)
     log_probs.append(torch.log(action_probs[action]))
+    
     observation, reward, terminated, truncated, info = env.step(action)
+    
     r.append(reward)
     total_reward += reward
 
@@ -465,9 +484,10 @@ while episode <= episode_count:
   s = torch.stack(s, dim=0).to(device=baseline_device)
   log_probs = torch.stack(log_probs, dim=0).to(device=baseline_device)
 
-  #----------------------
-  # agent network updates
-  #----------------------
+
+  ############################
+  # NETWORK TRAINING UPDATES #
+  ############################
 
   # calculate discounted rewards and train baseline network
   dr = torch.zeros(episode_length, dtype=torch.float32, device=baseline_device)
@@ -494,7 +514,7 @@ while episode <= episode_count:
   policy_optim.step()
 
 
-  # history and average
+  # reward history and average
   reward_history = np.append(reward_history, np.mean(r))
   
   if (episode >= avg_window_1):
@@ -519,10 +539,9 @@ plt.show()
 plt.pause(0.01)
 
 # Final demo episode (always rendered)
-env.max_steps = 36000
+env.max_steps = 36000 # 10 minutes
 
 observation, info = env.reset()
-norm_obs = torch.tensor(env.normalize_obs(observation), device=policy_device)
 
 while True:
   norm_obs = torch.tensor(env.normalize_obs(observation), dtype=torch.float32, device=policy_device)
