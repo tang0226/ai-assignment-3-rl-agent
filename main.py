@@ -4,6 +4,9 @@ from torch.optim import AdamW
 import gymnasium as gym
 import pygame
 import numpy as np
+import matplotlib.pyplot as plt
+import time
+import datetime
 
 sqrt2 = 2 ** 0.5
 
@@ -238,7 +241,10 @@ class SlipperyEnv(gym.Env):
 
     observation = self._get_obs()
     info = self._get_info()
-    return observation, reward, False, None, info
+
+    if (self.curr_step == self.max_steps):
+      return observation, reward, False, True, info
+    return observation, reward, False, False, info
   
   
   def setup_pygame(self):
@@ -341,7 +347,7 @@ class SlipperyRewardEstNN(nn.Module):
     return logits
 
 
-
+# Environment and training settings
 env = SlipperyEnv(
   size=500,
   agent_size=40,
@@ -358,31 +364,60 @@ env = SlipperyEnv(
   target_reset_interval=600,
 )
 
-env = gym.wrappers.TimeLimit(env, env.max_steps)
-unwrapped = env.unwrapped
+# learning rates for policy and baseline networks
+a_theta = 0.001
+a_b = 0.001
+
+# reward / return settings
+gamma = 0.995
+return_scale = 0.1
+
+episode_count = 10000
+
+# rendering and graphing settings
+render_during_training = False
+episode_render_interval = 500
+episode_print_interval = 10
+
+avg_window_1 = 20
+avg_window_2 = 100
+
 
 policy = SlipperyAgentNN()
 policy_device = 'cpu'
 policy.to(policy_device)
-# learning rate for policy network
-a_theta = 0.001
 policy_optim = AdamW(policy.parameters(), lr=a_theta)
 
 baseline = SlipperyRewardEstNN()
 baseline_device = 'cpu'
 baseline.to(baseline_device)
-# learning rate for baseline network
-a_b = 0.001
 baseline_optim = AdamW(baseline.parameters(), lr=a_b)
 
-gamma = 0.995
-return_scale = 0.1
+# matplotlib
+plt.ion()
+
+fig, ax = plt.subplots()
+
+reward_graph, = ax.plot([], [], 'c-', label='reward/step')
+reward_avg_graph_1, = ax.plot([], [], 'b-', label=f'avg. of {avg_window_1}')
+reward_avg_graph_2, = ax.plot([], [], 'r-', label=f'avg. of {avg_window_2}')
+ax.legend()
+ax.set_xlabel('episode')
+ax.set_ylabel('reward/step')
+ax.set_title('Average Agent Reward Per Episode')
+
+plt.show()
+
+reward_history = np.array([])
+reward_avg_1 = []
+reward_avg_2 = []
 
 observation, info = env.reset()
-norm_obs = torch.tensor(unwrapped.normalize_obs(observation), device=policy_device)
+norm_obs = torch.tensor(env.normalize_obs(observation), device=policy_device)
 episode = 0
 
-while True:
+start_time = time.perf_counter()
+while episode <= episode_count:
   total_reward = 0
   observation, info = env.reset()
 
@@ -394,12 +429,11 @@ while True:
   log_probs = []
 
   episode_length = 0
-  should_render = episode % 500 == 0
-  #should_render = False
+  should_render = render_during_training and episode % episode_render_interval == 0
   
   # run the episode
   while True:
-    norm_obs = torch.tensor(unwrapped.normalize_obs(observation), dtype=torch.float32, device=policy_device)
+    norm_obs = torch.tensor(env.normalize_obs(observation), dtype=torch.float32, device=policy_device)
     # get action
     action = None
     
@@ -418,13 +452,13 @@ while True:
     episode_length += 1
 
     if (should_render):
-      unwrapped.render()
+      env.render()
 
     # check if the episode is over
     if terminated or truncated:
       # clean up pygame if this episode was rendered
       if (should_render):
-        unwrapped.cleanup_pygame()
+        env.cleanup_pygame()
       break
   
   # convert lists to tensors and move to GPU for baseline network training
@@ -445,10 +479,10 @@ while True:
 
   b_values = baseline.forward(s)
 
-  baseline_loss = torch.mean((b_values - dr) ** 2)
+  b_loss = torch.mean((b_values - dr) ** 2)
 
   baseline_optim.zero_grad()
-  baseline_loss.backward()
+  b_loss.backward()
   baseline_optim.step()
   
   # train policy
@@ -459,5 +493,52 @@ while True:
   policy_loss.backward()
   policy_optim.step()
 
-  print(episode, np.mean(r), baseline_loss.item())
+
+  # history and average
+  reward_history = np.append(reward_history, np.mean(r))
+  
+  if (episode >= avg_window_1):
+    reward_avg_1.append(reward_history[-avg_window_1:].mean())
+  if (episode >= avg_window_2):
+    reward_avg_2.append(reward_history[-avg_window_2:].mean())
+
+  if episode % episode_print_interval == 0:
+    print(str(datetime.timedelta(seconds=time.perf_counter() - start_time)), episode, np.mean(r), b_loss.item())
   episode += 1
+
+
+
+# final graph render
+reward_graph.set_data(np.arange(episode), reward_history)
+reward_avg_graph_1.set_data(np.arange(avg_window_1, episode), reward_avg_1)
+reward_avg_graph_2.set_data(np.arange(avg_window_2, episode), reward_avg_2)
+
+plt.xlim(0, episode - 1)
+plt.ylim(-0.1, 0.7)
+plt.show()
+plt.pause(0.01)
+
+# Final demo episode (always rendered)
+env.max_steps = 36000
+
+observation, info = env.reset()
+norm_obs = torch.tensor(env.normalize_obs(observation), device=policy_device)
+
+while True:
+  norm_obs = torch.tensor(env.normalize_obs(observation), dtype=torch.float32, device=policy_device)
+  # get action
+  action = None
+  
+  policy_logits = policy.forward(norm_obs)
+  action_probs = torch.softmax(policy_logits, dim=-1)
+  dist = torch.distributions.Categorical(action_probs)
+  # sample an action from the action probability distribution
+  action = dist.sample().item()
+  observation, reward, terminated, truncated, info = env.step(action)
+
+  env.render()
+
+  # check if the episode is over
+  if terminated or truncated:
+    env.cleanup_pygame()
+    break
