@@ -24,7 +24,7 @@ class SlipperyEnv(gym.Env):
       friction: float = 0.95,
       accel = 0.05,
       min_target_dist_coeff: float = 0.4,
-      goal_reward: float = 20,
+      target_reward: float = 20,
       time_penalty: float = -1/60,
       direction_reward_scale: float = 0.5,
       edge_penalty: float = -20,
@@ -39,7 +39,7 @@ class SlipperyEnv(gym.Env):
     self.friction = friction                             # Coefficient of friction
     self.accel = accel                                   # Acceleration of movement, measured in px/frame^2
     self.min_target_dist_coeff = min_target_dist_coeff   # Relates environment size to the min distance for agent to travel
-    self.goal_reward = goal_reward                       # Reward for reaching goal
+    self.target_reward = target_reward                       # Reward for reaching target
     self.time_penalty = time_penalty                     # Reward lost with each frame
     self.direction_reward_scale = direction_reward_scale # Scale of the reward depending on what direction the agent is moving
     self.edge_penalty = edge_penalty                     # Reward lost for hitting edge
@@ -175,6 +175,8 @@ class SlipperyEnv(gym.Env):
 
     self.curr_step = 0
     self.target_reset_timer = self.target_reset_interval
+    self.targets_reached = 0
+    self.falls = 0
 
     return observation, info
 
@@ -199,10 +201,12 @@ class SlipperyEnv(gym.Env):
     # reward
     reward = 0
     if self._get_dist_to_target() < self.agent_size / 2:
-      reward += self.goal_reward
+      reward += self.target_reward
       # reset the target position and timer
       self.target_reset_timer = self.target_reset_interval
       self._reset_target_position()
+
+      self.targets_reached += 1
     else:
       c_sim = cosine_similarity(
         self._target_position - self._agent_position,
@@ -220,6 +224,7 @@ class SlipperyEnv(gym.Env):
     ):
       # penalty for "falling off the edge"
       reward += self.edge_penalty
+      self.falls += 1
       # respawn agent
       self._respawn_agent()
     
@@ -357,7 +362,7 @@ env = SlipperyEnv(
   friction=0.98,
   accel=0.08,
 
-  goal_reward=30,
+  target_reward=30,
   direction_reward_scale=1,
   edge_penalty=-30,
 
@@ -401,27 +406,40 @@ baseline_device = 'cpu'
 baseline.to(baseline_device)
 baseline_optim = torch.optim.AdamW(baseline.parameters(), lr=a_b)
 
-
 ########################################
 # MATPLOTLIB / GRAPHING INITIALIZATION #
 ########################################
 
 plt.ion()
-fig, ax = plt.subplots()
+fig, ax = plt.subplots(2, 1, figsize=(6.4, 9))
 
-reward_graph, = ax.plot([], [], 'c-', label='reward/step')
-reward_avg_graph_1, = ax.plot([], [], 'b-', label=f'avg. of {avg_window_1}')
-reward_avg_graph_2, = ax.plot([], [], 'r-', label=f'avg. of {avg_window_2}')
-ax.legend()
-ax.set_xlabel('episode')
-ax.set_ylabel('reward/step')
-ax.set_title('Average Agent Reward Per Episode')
+rew_ax, target_ax = ax
+
+reward_graph, = rew_ax.plot([], [], 'c-', label='reward/step')
+reward_avg_graph_1, = rew_ax.plot([], [], 'b-', label=f'avg. of {avg_window_1}')
+reward_avg_graph_2, = rew_ax.plot([], [], 'r-', label=f'avg. of {avg_window_2}')
+rew_ax.legend()
+rew_ax.set_xlabel('episode')
+rew_ax.set_ylabel('reward/step')
+rew_ax.set_title('Average Reward Per Step')
+
+target_graph, = target_ax.plot([], [], 'c-', label='targets reached')
+target_avg_graph_1, = target_ax.plot([], [], 'b-', label=f'avg. of {avg_window_1}')
+target_avg_graph_2, = target_ax.plot([], [], 'r-', label=f'avg. of {avg_window_2}')
+target_ax.legend()
+target_ax.set_xlabel('episode')
+target_ax.set_ylabel('targets reached')
+target_ax.set_title('Targets Reached')
 
 plt.show()
 
 reward_history = np.array([])
 reward_avg_1 = []
 reward_avg_2 = []
+
+target_history = np.array([])
+target_avg_1 = []
+target_avg_2 = []
 
 episode = 0
 start_time = time.perf_counter()
@@ -514,16 +532,19 @@ while episode <= episode_count:
   policy_optim.step()
 
 
-  # reward history and average
+  # stats history and average
   reward_history = np.append(reward_history, np.mean(r))
+  target_history = np.append(target_history, env.targets_reached)
   
   if (episode >= avg_window_1):
     reward_avg_1.append(reward_history[-avg_window_1:].mean())
+    target_avg_1.append(target_history[-avg_window_1:].mean())
   if (episode >= avg_window_2):
     reward_avg_2.append(reward_history[-avg_window_2:].mean())
+    target_avg_2.append(target_history[-avg_window_2:].mean())
 
   if episode % episode_print_interval == 0:
-    print(str(datetime.timedelta(seconds=time.perf_counter() - start_time)), episode, np.mean(r), b_loss.item())
+    print(f'{datetime.timedelta(seconds=time.perf_counter() - start_time)} episode {episode}: {env.falls} falls, {env.targets_reached} targets reached, {np.mean(r):.4f} mean return, {b_loss.item():.4f} baseline network loss')
   episode += 1
 
 
@@ -533,13 +554,23 @@ reward_graph.set_data(np.arange(episode), reward_history)
 reward_avg_graph_1.set_data(np.arange(avg_window_1, episode), reward_avg_1)
 reward_avg_graph_2.set_data(np.arange(avg_window_2, episode), reward_avg_2)
 
-plt.xlim(0, episode - 1)
-plt.ylim(-0.1, 0.7)
+rew_ax.set_xlim(0, episode - 1)
+rew_ax.set_ylim(-0.1, 0.7)
+
+target_graph.set_data(np.arange(episode), target_history)
+target_avg_graph_1.set_data(np.arange(avg_window_1, episode), target_avg_1)
+target_avg_graph_2.set_data(np.arange(avg_window_2, episode), target_avg_2)
+
+target_ax.set_xlim(0, episode - 1)
+target_ax.set_ylim(0, target_history.max() + 1)
+
+fig.tight_layout()
+
 plt.show()
 plt.pause(0.01)
 
 # Final demo episode (always rendered)
-env.max_steps = 36000 # 10 minutes
+env.max_steps = 108000 # 30 minutes
 
 observation, info = env.reset()
 
